@@ -38,6 +38,12 @@ tasks.withType(Test).configureEach {
     jvmArgs "--enable-preview"
 }
 
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
 tasks.withType(JavaCompile).configureEach {
     options.fork = true
     options.compilerArgs.add("-Amicronaut.processing.group=$project.group")

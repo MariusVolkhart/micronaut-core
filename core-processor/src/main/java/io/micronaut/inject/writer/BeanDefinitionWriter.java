@@ -132,6 +132,18 @@ import io.micronaut.inject.ast.PropertyElement;
 import io.micronaut.inject.ast.TypedElement;
 import io.micronaut.inject.ast.beans.BeanElement;
 import io.micronaut.inject.ast.beans.BeanElementBuilder;
+import io.micronaut.inject.builder.BeanDefinitionBuilder;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.BeanInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.BeanRegistrationInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.BeanRegistrationsInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.BeansInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.MapOfBeansInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.OptionalBeanInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.ParameterInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.PropertyInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.StreamOfBeansInjectionPoint;
+import io.micronaut.inject.builder.BeanDefinitionInjectionPoint.ValueInjectionPoint;
 import io.micronaut.inject.configuration.builder.ConfigurationBuilderDefinition;
 import io.micronaut.inject.configuration.builder.ConfigurationBuilderOfFieldDefinition;
 import io.micronaut.inject.configuration.builder.ConfigurationBuilderOfPropertyDefinition;
@@ -216,7 +228,7 @@ import static io.micronaut.inject.visitor.BeanElementVisitor.VISITORS;
  */
 @NullUnmarked
 @Internal
-public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefinitionVisitor, BeanElement, Toggleable {
+public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefinitionVisitor, BeanElement, Toggleable, BeanDefinitionBuilder<ClassElement> {
     @NextMajorVersion("Inline as true")
     public static final String OMIT_CONFPROP_INJECTION_POINTS = "micronaut.processing.omit.confprop.injectpoints";
 
@@ -700,6 +712,8 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
     private final Function<String, ExpressionDef> loadClassValueExpressionFn;
 
+    private ConstructorDefinition<ClassElement> constructorDefinition;
+
     private Map<String, byte[]> output;
 
     /**
@@ -872,6 +886,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             .superclass(TypeDef.parameterized(superType, argumentType));
 
         loadClassValueExpressionFn = AnnotationMetadataGenUtils.createLoadClassValueExpressionFn(beanDefinitionTypeDef, loadTypeMethods);
+    }
+
+    @Override
+    public void constructor(ConstructorDefinition<ClassElement> constructorDefinition) {
+        this.constructorDefinition = constructorDefinition;
+
+        evaluatedExpressionProcessor.processEvaluatedExpressions(constructorDefinition.annotationMetadata(), null);
+        for (BeanDefinitionInjectionPoint<ClassElement> constructorInjectionPoint : constructorDefinition.injectionPoints()) {
+            evaluatedExpressionProcessor.processEvaluatedExpressions(constructorInjectionPoint.getAnnotationMetadata(), null);
+        }
     }
 
     /**
@@ -1140,11 +1164,70 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             // now prepare the implementation of the build method. See BeanFactory interface
             visitBuildConstructorDefinition(constructor, requiresReflection);
 
-            evaluatedExpressionProcessor.processEvaluatedExpressions(constructor.getAnnotationMetadata(), null);
-            for (ParameterElement parameter : constructor.getParameters()) {
-                evaluatedExpressionProcessor.processEvaluatedExpressions(parameter.getAnnotationMetadata(), null);
+            constructor(
+                new ConstructorDefinition<>(
+                    constructor,
+                    Arrays.stream(constructor.getParameters()).map(this::getInjectionPoint).toList(),
+                    requiresReflection)
+            );
+        }
+    }
+    private BeanDefinitionInjectionPoint<ClassElement> getInjectionPoint(ParameterElement parameter) {
+        AnnotationMetadata annotationMetadata = parameter.getAnnotationMetadata();
+        if (isAnnotatedWithParameter(annotationMetadata)) {
+            return new ParameterInjectionPoint<>(parameter.getGenericType(), parameter, parameter.getName());
+        }
+        boolean isArray;
+        final ClassElement genericType = parameter.getGenericType();
+        if (!isInnerType(genericType)) {
+            if (annotationMetadata.hasDeclaredStereotype(Property.class)) {
+                Optional<String> property = parameter.stringValue(Property.class, "name");
+                if (property.isPresent()) {
+                    String value = property.get();
+                    return new PropertyInjectionPoint<>(genericType, parameter, parameter.getName(), value);
+                }
+            }
+            if (annotationMetadata.hasDeclaredStereotype(Value.class)) {
+                Optional<String> valueValue = parameter.stringValue(Value.class);
+                return new ValueInjectionPoint<>(
+                    genericType,
+                    parameter,
+                    valueValue.orElseThrow(() -> new ProcessingException(parameter, "Value injection requires a value")),
+                    parameter.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()
+                );
             }
         }
+        isArray = genericType.isArray();
+        if (genericType.isAssignable(Collection.class) || isArray) {
+            ClassElement typeArgument = genericType.isArray() ? genericType.fromArray() : genericType.getFirstTypeArgument().orElse(null);
+            if (typeArgument != null && !typeArgument.isPrimitive()) {
+                if (typeArgument.isAssignable(BeanRegistration.class)) {
+                    return new BeanRegistrationsInjectionPoint<>(genericType, parameter, typeArgument.getFirstTypeArgument().orElseThrow());
+                } else {
+                    return new BeansInjectionPoint<>(genericType, parameter, typeArgument);
+                }
+            } else {
+                return new BeanInjectionPoint<>(genericType, parameter);
+            }
+        } else if (isInjectableMap(genericType)) {
+            Map<String, ClassElement> mapArguments = genericType.getTypeArguments(Map.class);
+            ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
+            ClassElement beanType = mapArguments.getOrDefault("V", objectType);
+            return new MapOfBeansInjectionPoint<>(genericType, parameter, beanType);
+        } else if (genericType.isAssignable(Stream.class)) {
+            ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
+            ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
+            return new StreamOfBeansInjectionPoint<>(genericType, parameter, beanType);
+        } else if (genericType.isAssignable(Optional.class)) {
+            ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
+            ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
+            return new OptionalBeanInjectionPoint<>(genericType, parameter, beanType);
+        } else if (genericType.isAssignable(BeanRegistration.class)) {
+            ClassElement objectType = visitorContext.getClassElement(Object.class).orElse(null);
+            ClassElement beanType = genericType.getFirstTypeArgument().orElse(objectType);
+            return new BeanRegistrationInjectionPoint<>(genericType, parameter, beanType);
+        }
+        return new BeanInjectionPoint<>(genericType, parameter);
     }
 
     @Override
@@ -1162,6 +1245,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
             // now prepare the implementation of the build method. See BeanFactory interface
             visitBuildConstructorDefinition(defaultConstructor, false);
+
+            constructor(
+                new ConstructorDefinition<>(
+                    annotationMetadata,
+                    List.of(),
+                    false)
+            );
         }
     }
 
@@ -1259,7 +1349,6 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         }
 
         if (buildMethodDefinition.postConstruct != null) {
-            //  for "super bean definition" we only add code to trigger "initialize"
             classDefBuilder.addSuperinterface(TypeDef.of(InitializingBeanDefinition.class));
             if (buildMethodDefinition.postConstruct.intercepted) {
                 // Create a new method that will be invoked by the intercepted chain
@@ -1785,9 +1874,10 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return buildFactoryGet(aThis, methodParameters, onBeanInstance, factoryBuildMethodDefinition, List.of());
         }
         if (buildMethodDefinition instanceof ConstructorBuildMethodDefinition constructorBuildMethodDefinition) {
-            if (constructorBuildMethodDefinition.constructor.hasParameters()) {
-                List<? extends ExpressionDef> values = getConstructorArgumentValues(aThis, methodParameters,
-                    List.of(buildMethodDefinition.getParameters()), isParametrized, constructorDefSupplier);
+            List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.injectionPoints();
+            if (!parameters.isEmpty()) {
+                List<? extends ExpressionDef> values = getConstructorArgumentValues2(aThis, methodParameters,
+                    parameters, isParametrized, constructorDefSupplier);
                 StatementDef statement = buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorBuildMethodDefinition, values);
                 if (constructorDef[0] != null) {
                     return StatementDef.multi(
@@ -3387,7 +3477,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return getQualifier(element, () -> argumentExpression);
     }
 
-    private ExpressionDef getQualifier(Element element, Supplier<ExpressionDef> argumentExpressionSupplier) {
+    private ExpressionDef getQualifier(AnnotationMetadata element, Supplier<ExpressionDef> argumentExpressionSupplier) {
         final List<String> qualifierNames = element.getAnnotationNamesByStereotype(AnnotationUtil.QUALIFIER);
         if (!qualifierNames.isEmpty()) {
             if (qualifierNames.size() == 1) {
@@ -3425,7 +3515,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return argumentExpression.invoke(PROVIDER_GET_ANNOTATION_METADATA_METHOD);
     }
 
-    private ExpressionDef getQualifierForAnnotation(Element element,
+    private ExpressionDef getQualifierForAnnotation(AnnotationMetadata element,
                                                     String annotationName,
                                                     ExpressionDef argumentExpression) {
         if (annotationName.equals(Primary.NAME)) {
@@ -3433,7 +3523,13 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return ExpressionDef.nullValue();
         }
         if (annotationName.equals(AnnotationUtil.NAMED)) {
-            final String n = element.stringValue(AnnotationUtil.NAMED).orElse(element.getName());
+            Optional<String> named = element.stringValue(AnnotationUtil.NAMED);
+            final String n = named.orElseGet(() -> {
+                if (element instanceof Named nmd) {
+                    return nmd.getName();
+                }
+                throw new IllegalStateException("Named annotation not found on element: " + element);
+            });
             if (!n.contains("$")) {
                 return TYPE_QUALIFIERS.invokeStatic(METHOD_QUALIFIER_BY_NAME, ExpressionDef.constant(n));
             }
@@ -4227,6 +4323,21 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return values;
     }
 
+    private List<? extends ExpressionDef> getConstructorArgumentValues2(VariableDef.This aThis,
+                                                                        List<VariableDef.MethodParameter> methodParameters,
+                                                                        List<BeanDefinitionInjectionPoint<ClassElement>> parameters,
+                                                                        boolean isParametrized,
+                                                                        Supplier<VariableDef> constructorMethodVarSupplier) {
+        List<ExpressionDef> values = new ArrayList<>();
+        for (int i = 0; i < parameters.size(); i++) {
+            BeanDefinitionInjectionPoint<ClassElement> parameter = parameters.get(i);
+            values.add(
+                getConstructorArgument2(aThis, methodParameters, parameter, i, isParametrized, constructorMethodVarSupplier)
+            );
+        }
+        return values;
+    }
+
     private static boolean hasInjectScope(ParameterElement[] parameters) {
         for (ParameterElement parameter : parameters) {
             if (hasInjectScope(parameter)) {
@@ -4270,11 +4381,11 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 return getInvokeGetPropertyValueForConstructor(aThis, methodParameters, index, parameter, property.get());
             }
             if (parameter.getValue(Value.class, EvaluatedExpressionReference.class).isPresent()) {
-                return getInvokeGetEvaluatedExpressionValueForConstructorArgument(aThis, index, parameter);
+                return getInvokeGetEvaluatedExpressionValueForConstructorArgument(aThis, index, parameter.getType());
             }
             Optional<String> valueValue = parameter.stringValue(Value.class);
             if (valueValue.isPresent()) {
-                return getInvokeGetPropertyPlaceholderValueForConstructor(aThis, methodParameters, index, parameter, valueValue.get());
+                return getInvokeGetPropertyPlaceholderValueForConstructor(aThis, methodParameters, index, parameter.getType(), valueValue.get());
             }
             return ExpressionDef.nullValue();
         }
@@ -4329,9 +4440,97 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         return result.cast(TypeDef.erasure(parameter.getType()));
     }
 
+    private ExpressionDef getConstructorArgument2(VariableDef.This aThis,
+                                                  List<VariableDef.MethodParameter> methodParameters,
+                                                  BeanDefinitionInjectionPoint<ClassElement> parameter,
+                                                  int index,
+                                                  boolean isParametrized,
+                                                  Supplier<VariableDef> constructorMethodVarSupplier) {
+        ExpressionDef expression = getValueBypassingBeanContext(parameter.type(), methodParameters);
+        if (expression != null) {
+            return expression;
+        }
+        return switch (parameter) {
+            case BeanInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_BEAN_FOR_CONSTRUCTOR_ARGUMENT, false, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case BeanRegistrationInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_BEAN_REGISTRATION_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case BeanRegistrationsInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_BEAN_REGISTRATIONS_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case BeansInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_BEANS_OF_TYPE_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case MapOfBeansInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_MAP_OF_TYPE_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case OptionalBeanInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(FIND_BEAN_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case StreamOfBeansInjectionPoint<ClassElement> v ->
+                invokeInjectionPoint(GET_STREAM_OF_TYPE_FOR_CONSTRUCTOR_ARGUMENT, true, v.type(), aThis, methodParameters, index, constructorMethodVarSupplier, v.annotationMetadata());
+            case ParameterInjectionPoint<ClassElement> v -> {
+                if (!isParametrized) {
+                    throw new IllegalArgumentException("Cannot resolve constructor argument for parameter [" + v.name() + "] of type [" + v.type() + "] because it is not parametrized");
+                }
+                yield methodParameters.get(2).invoke(
+                    GET_MAP_METHOD,
+                    ExpressionDef.constant(v.name())
+                );
+            }
+            case PropertyInjectionPoint<ClassElement> v ->
+                getInvokeGetPropertyValueForConstructor(aThis, methodParameters, index, v.type(), v.parameterName(), v.value());
+            case ValueInjectionPoint<ClassElement> v -> {
+                if (v.hasExpression()) {
+                    yield getInvokeGetEvaluatedExpressionValueForConstructorArgument(aThis, index, v.type());
+                }
+                yield getInvokeGetPropertyPlaceholderValueForConstructor(aThis, methodParameters, index, v.type(), v.value());
+            }
+        };
+    }
+
+    private ExpressionDef.Cast invokeInjectionPoint(Method methodToInvoke,
+                                                    boolean hasGenericType,
+                                                    ClassElement resultType,
+                                                    VariableDef.This aThis,
+                                                    List<VariableDef.MethodParameter> methodParameters,
+                                                    int index,
+                                                    Supplier<VariableDef> constructorMethodVarSupplier,
+                                                    AnnotationMetadata am) {
+        boolean isArray = resultType.isArray();
+        List<ExpressionDef> values = new ArrayList<>();
+        // load the first two arguments of the method (the BeanResolutionContext and the BeanContext) to be passed to the method
+        values.add(methodParameters.get(0));
+        values.add(methodParameters.get(1));
+        // pass the index of the method as the third argument
+        values.add(ExpressionDef.constant(index));
+        if (hasGenericType) {
+            values.add(
+                resolveConstructorArgumentGenericType(resultType, index, constructorMethodVarSupplier)
+            );
+        }
+        // push qualifier
+        values.add(
+            getQualifier(am, () -> resolveConstructorArgument(index, constructorMethodVarSupplier.get()))
+        );
+        ExpressionDef result = aThis.superRef().invoke(methodToInvoke, values);
+        if (isArray && hasGenericType) {
+            result = convertToArray(resultType.fromArray(), result);
+        }
+        return result.cast(TypeDef.erasure(resultType));
+    }
+
     private ExpressionDef getInvokeGetPropertyValueForConstructor(VariableDef.This aThis,
                                                                   List<VariableDef.MethodParameter> methodParameters,
-                                                                  int i, ParameterElement entry, String value) {
+                                                                  int i,
+                                                                  ParameterElement entry,
+                                                                  String value) {
+
+        return getInvokeGetPropertyValueForConstructor(aThis, methodParameters, i, entry.getType(), entry.getName(), value);
+    }
+
+    private ExpressionDef getInvokeGetPropertyValueForConstructor(VariableDef.This aThis,
+                                                                  List<VariableDef.MethodParameter> methodParameters,
+                                                                  int i,
+                                                                  ClassElement type,
+                                                                  String propertyName,
+                                                                  String value) {
 
         return aThis.superRef().invoke(
             GET_PROPERTY_VALUE_FOR_CONSTRUCTOR_ARGUMENT,
@@ -4345,14 +4544,16 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             // 5th property value
             ExpressionDef.constant(value),
             // 6 cli property name
-            ExpressionDef.constant(getCliPrefix(entry.getName()))
+            ExpressionDef.constant(getCliPrefix(propertyName))
 
-        ).cast(TypeDef.erasure(entry.getType()));
+        ).cast(TypeDef.erasure(type));
     }
 
     private ExpressionDef getInvokeGetPropertyPlaceholderValueForConstructor(VariableDef.This aThis,
                                                                              List<VariableDef.MethodParameter> methodParameters,
-                                                                             int i, ParameterElement entry, String value) {
+                                                                             int i,
+                                                                             ClassElement type,
+                                                                             String value) {
 
         return aThis.superRef().invoke(
             GET_PROPERTY_PLACEHOLDER_VALUE_FOR_CONSTRUCTOR_ARGUMENT,
@@ -4365,14 +4566,15 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             ExpressionDef.constant(i),
             // 5th property value
             ExpressionDef.constant(value)
-        ).cast(TypeDef.erasure(entry.getType()));
+        ).cast(TypeDef.erasure(type));
     }
 
     private ExpressionDef getInvokeGetEvaluatedExpressionValueForConstructorArgument(VariableDef.This aThis,
-                                                                                     int i, ParameterElement entry) {
+                                                                                     int i,
+                                                                                     ClassElement type) {
         return aThis.superRef()
             .invoke(GET_EVALUATED_EXPRESSION_VALUE_FOR_CONSTRUCTOR_ARGUMENT, ExpressionDef.constant(i))
-            .cast(TypeDef.erasure(entry.getType()));
+            .cast(TypeDef.erasure(type));
     }
 
     private ExpressionDef resolveConstructorArgumentGenericType(ClassElement type, int argumentIndex, Supplier<VariableDef> constructorMethodVarSupplier) {
