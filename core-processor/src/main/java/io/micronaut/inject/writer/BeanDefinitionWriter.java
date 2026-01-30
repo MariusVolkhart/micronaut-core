@@ -893,7 +893,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         this.constructorDefinition = constructorDefinition;
 
         evaluatedExpressionProcessor.processEvaluatedExpressions(constructorDefinition.annotationMetadata(), null);
-        for (BeanDefinitionInjectionPoint<ClassElement> constructorInjectionPoint : constructorDefinition.injectionPoints()) {
+        for (BeanDefinitionInjectionPoint<ClassElement> constructorInjectionPoint : constructorDefinition.parameters()) {
             evaluatedExpressionProcessor.processEvaluatedExpressions(constructorInjectionPoint.getAnnotationMetadata(), null);
         }
     }
@@ -1166,6 +1166,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
             constructor(
                 new ConstructorDefinition<>(
+                    constructor.getOwningType(),
                     constructor,
                     Arrays.stream(constructor.getParameters()).map(this::getInjectionPoint).toList(),
                     requiresReflection)
@@ -1248,6 +1249,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
 
             constructor(
                 new ConstructorDefinition<>(
+                    ClassElement.of(((ClassTypeDef) beanTypeDef).getName()),
                     annotationMetadata,
                     List.of(),
                     false)
@@ -1874,11 +1876,11 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             return buildFactoryGet(aThis, methodParameters, onBeanInstance, factoryBuildMethodDefinition, List.of());
         }
         if (buildMethodDefinition instanceof ConstructorBuildMethodDefinition constructorBuildMethodDefinition) {
-            List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.injectionPoints();
+            List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
             if (!parameters.isEmpty()) {
                 List<? extends ExpressionDef> values = getConstructorArgumentValues2(aThis, methodParameters,
                     parameters, isParametrized, constructorDefSupplier);
-                StatementDef statement = buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorBuildMethodDefinition, values);
+                StatementDef statement = buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorDefinition, values);
                 if (constructorDef[0] != null) {
                     return StatementDef.multi(
                         constructorDef[0],
@@ -1887,7 +1889,7 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
                 }
                 return statement;
             }
-            return buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorBuildMethodDefinition, List.of());
+            return buildConstructorInstantiate(aThis, methodParameters, onBeanInstance, constructorDefinition, List.of());
         }
         if (buildMethodDefinition instanceof CustomBuildMethodDefinition customBuildMethodDefinition) {
             List<? extends ExpressionDef> values = getConstructorArgumentValues(aThis, methodParameters,
@@ -1900,22 +1902,25 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     private StatementDef buildConstructorInstantiate(VariableDef.This aThis,
                                                      List<VariableDef.MethodParameter> methodParameters,
                                                      Function<ExpressionDef, StatementDef> onBeanInstance,
-                                                     ConstructorBuildMethodDefinition constructorBuildMethodDefinition,
+                                                     ConstructorDefinition<ClassElement> constructorDefinition,
                                                      List<? extends ExpressionDef> values) {
-        List<ParameterElement> parameters = List.of(constructorBuildMethodDefinition.constructor.getSuspendParameters());
-        if (isConstructorIntercepted(constructorBuildMethodDefinition.constructor)) {
-            ClassTypeDef factoryInterceptor = createConstructorInterceptor(constructorBuildMethodDefinition);
+        List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
+        if (isConstructorIntercepted(constructorDefinition.annotationMetadata())) {
+            ClassTypeDef factoryInterceptor = createConstructorInterceptor(constructorDefinition);
             return onBeanInstance.apply(
-                invokeConstructorChain(
+                invokeConstructorChain2(
                     aThis,
                     methodParameters,
-                    factoryInterceptor.instantiate(CONSTRUCTOR_ABSTRACT_CONSTRUCTOR_IP, aThis),
+                    factoryInterceptor.instantiate(
+                        List.of(TypeDef.of(BeanDefinition.class), TypeDef.of(BeanResolutionContext.class), TypeDef.of(BeanContext.class)),
+                        List.of(aThis, methodParameters.get(0), methodParameters.get(1))
+                    ),
                     TypeDef.OBJECT.array().instantiate(values),
                     parameters)
             );
         }
         return onBeanInstance.apply(
-            initializeBean(aThis, methodParameters, constructorBuildMethodDefinition, values)
+            initializeBean(aThis, methodParameters, constructorDefinition, values)
         );
     }
 
@@ -1995,22 +2000,20 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
     }
 
     private ExpressionDef initializeBean(VariableDef.This aThis,
-                                         List<VariableDef.MethodParameter> methodParameters,
-                                         ConstructorBuildMethodDefinition constructorBuildMethodDefinition,
+                                         List<? extends ExpressionDef> methodParameters,
+                                         ConstructorDefinition<ClassElement> constructorDefinition,
                                          List<? extends ExpressionDef> values) {
-        MethodElement constructor = constructorBuildMethodDefinition.constructor;
         List<ExpressionDef> hasValuesExpressions;
         if (values == null) {
             hasValuesExpressions = null;
         } else {
             hasValuesExpressions = new ArrayList<>();
-            ParameterElement[] parameters = constructorBuildMethodDefinition.getParameters();
             for (int i = 0; i < values.size(); i++) {
                 ExpressionDef value = values.get(i);
-                ParameterElement parameter = parameters[i];
-                if (parameter.hasAnnotation(Property.class)) {
+                BeanDefinitionInjectionPoint<ClassElement> parameter = constructorDefinition.parameters().get(i);
+                if (parameter.getAnnotationMetadata().hasAnnotation(Property.class)) {
                     hasValuesExpressions.add(
-                        getContainsPropertyCheck(aThis, methodParameters, parameter)
+                        getContainsPropertyCheck(aThis, methodParameters, parameter.type(), parameter.getAnnotationMetadata())
                     );
                 } else {
                     hasValuesExpressions.add(value.isNonNull());
@@ -2018,16 +2021,28 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             }
 
         }
-        return MethodGenUtils.invokeBeanConstructor(constructor, constructorBuildMethodDefinition.requiresReflection, true, values, hasValuesExpressions);
+        return MethodGenUtils.invokeBeanConstructor(
+            constructorDefinition.owningType(),
+            "<init>",
+            constructorDefinition.owningType(),
+            constructorDefinition.parameters().stream().map(p -> p.getAnnotationMetadata()).toList(),
+            constructorDefinition.parameters().stream().map(BeanDefinitionInjectionPoint::type).toList(),
+            false,
+            constructorDefinition.requiresReflection(),
+            true,
+            values,
+            hasValuesExpressions
+        );
     }
 
     private ExpressionDef getContainsPropertyCheck(VariableDef.This aThis,
-                                                   List<VariableDef.MethodParameter> methodParameters,
-                                                   ParameterElement parameterElement) {
-        String propertyName = parameterElement.stringValue(Property.class, "name").orElseThrow();
+                                                   List<? extends ExpressionDef> methodParameters,
+                                                   ClassElement type,
+                                                   AnnotationMetadata annotationMetadata) {
+        String propertyName = annotationMetadata.stringValue(Property.class, "name").orElseThrow();
 
         return aThis.invoke(
-            isMultiValueProperty(parameterElement.getType()) ? CONTAINS_PROPERTIES_VALUE_METHOD : CONTAINS_PROPERTY_VALUE_METHOD,
+            isMultiValueProperty(type) ? CONTAINS_PROPERTIES_VALUE_METHOD : CONTAINS_PROPERTY_VALUE_METHOD,
 
             methodParameters.get(0),
             methodParameters.get(1),
@@ -2067,13 +2082,34 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         );
     }
 
-    private ClassTypeDef createConstructorInterceptor(ConstructorBuildMethodDefinition constructorBuildMethodDefinition) {
+    private ClassTypeDef createConstructorInterceptor(ConstructorDefinition<ClassElement> constructorDefinition) {
         String interceptedConstructorWriterName = "ConstructorInterceptor";
         ClassDef.ClassDefBuilder innerClassBuilder = ClassDef.builder(interceptedConstructorWriterName)
             .synthetic()
             .addModifiers(Modifier.FINAL)
             .superclass(ClassTypeDef.of(AbstractBeanDefinitionBeanConstructor.class))
             .addAnnotation(Generated.class);
+
+        FieldDef beanResolutionContextField = FieldDef.builder("brc", BeanResolutionContext.class)
+            .overrideModifiers(Modifier.PRIVATE, Modifier.FINAL)
+            .build();
+
+        FieldDef beanContextField = FieldDef.builder("bc", BeanContext.class)
+            .overrideModifiers(Modifier.PRIVATE, Modifier.FINAL)
+            .build();
+
+        innerClassBuilder.addField(beanResolutionContextField);
+        innerClassBuilder.addField(beanContextField);
+
+        innerClassBuilder.addMethod(
+            MethodDef.constructor()
+                .addParameters(BeanDefinition.class, BeanResolutionContext.class, BeanContext.class)
+                .build((aThis, methodParameters) -> StatementDef.multi(
+                    aThis.superRef().invokeConstructor(CONSTRUCTOR_ABSTRACT_CONSTRUCTOR_IP, methodParameters.get(0)),
+                    aThis.field(beanResolutionContextField).assign(methodParameters.get(1)),
+                    aThis.field(beanContextField).assign(methodParameters.get(2))
+                ))
+        );
 
         innerClassBuilder.addMethod(
             MethodDef.constructor()
@@ -2086,12 +2122,14 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
         innerClassBuilder.addMethod(
             MethodDef.override(METHOD_BEAN_CONSTRUCTOR_INSTANTIATE)
                 .build((aThis, methodParameters) -> {
-                    ParameterElement[] parameters = constructorBuildMethodDefinition.constructor.getSuspendParameters();
-                    List<ExpressionDef> values = IntStream.range(0, parameters.length)
-                        .<ExpressionDef>mapToObj(index -> methodParameters.get(0).arrayElement(index).cast(TypeDef.erasure(parameters[index].getType())))
+                    List<BeanDefinitionInjectionPoint<ClassElement>> parameters = constructorDefinition.parameters();
+                    List<ExpressionDef> values = IntStream.range(0, parameters.size())
+                        .<ExpressionDef>mapToObj(index -> methodParameters.getFirst().arrayElement(index).cast(TypeDef.erasure(parameters.getFirst().type())))
                         .toList();
-                    return MethodGenUtils.invokeBeanConstructor(ClassElement.of(beanDefinitionName), constructorBuildMethodDefinition.constructor, true, values)
-                        .returning();
+                    List<ExpressionDef> methodParametersInitializeStyle = new ArrayList<>(2);
+                    methodParametersInitializeStyle.add(aThis.field(beanResolutionContextField));
+                    methodParametersInitializeStyle.add(aThis.field(beanContextField));
+                    return initializeBean(aThis, methodParametersInitializeStyle, constructorDefinition, values).returning();
                 })
         );
 
@@ -4248,10 +4286,37 @@ public final class BeanDefinitionWriter implements ClassOutputWriter, BeanDefini
             );
     }
 
-    private boolean isConstructorIntercepted(Element constructor) {
+    private ExpressionDef invokeConstructorChain2(VariableDef.This aThis,
+                                                 List<VariableDef.MethodParameter> methodParameters,
+                                                 ExpressionDef beanConstructor,
+                                                 ExpressionDef constructorValue,
+                                                 List<BeanDefinitionInjectionPoint<ClassElement>> parameters) {
+        return ClassTypeDef.of(ConstructorInterceptorChain.class)
+            .invokeStatic(
+                METHOD_DESCRIPTOR_CONSTRUCTOR_INSTANTIATE,
+                // 1st argument: The resolution context
+                methodParameters.get(0),
+                // 2nd argument: The bean context
+                methodParameters.get(1),
+                // 3rd argument: The interceptors if present
+                StringUtils.isNotEmpty(interceptedType) ?
+                    constructorValue.arrayElement(AopProxyWriter.findInterceptorsListParameterIndex2(parameters)).cast(List.class)
+                    : ExpressionDef.nullValue(),
+                // 4th argument: the bean definition
+                aThis,
+                // 5th argument: The constructor
+                beanConstructor,
+                // 6th argument:  additional proxy parameters count
+                interceptedType != null ? ExpressionDef.constant(AopProxyWriter.ADDITIONAL_PARAMETERS_COUNT) : ExpressionDef.constant(0),
+                // 7th argument:  load the Object[] for the parameters
+                constructorValue
+            );
+    }
+
+    private boolean isConstructorIntercepted(AnnotationMetadata constructorAnnotationMetadata) {
         // a constructor is intercepted when this bean is an advised type but not proxied
         // and any AROUND_CONSTRUCT annotations are present
-        AnnotationMetadataHierarchy annotationMetadata = new AnnotationMetadataHierarchy(this.annotationMetadata, constructor.getAnnotationMetadata());
+        AnnotationMetadataHierarchy annotationMetadata = new AnnotationMetadataHierarchy(this.annotationMetadata, constructorAnnotationMetadata);
         final String interceptType = "AROUND_CONSTRUCT";
         // for beans that are @Around(proxyTarget=true) only the constructor of the proxy target should be intercepted. Beans returned from factories are always proxyTarget=true
 

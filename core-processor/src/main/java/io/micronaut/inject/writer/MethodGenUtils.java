@@ -15,6 +15,8 @@
  */
 package io.micronaut.inject.writer;
 
+import io.micronaut.core.annotation.AnnotationMetadata;
+import io.micronaut.core.annotation.AnnotationMetadataProvider;
 import io.micronaut.core.annotation.Internal;
 import org.jspecify.annotations.NullUnmarked;
 import org.jspecify.annotations.Nullable;
@@ -65,7 +67,7 @@ public final class MethodGenUtils {
      * @return The number if masks
      * @since 4.6.2
      */
-    public static int calculateNumberOfKotlinDefaultsMasks(List<ParameterElement> parameters) {
+    public static int calculateNumberOfKotlinDefaultsMasks(List<?> parameters) {
         return (int) Math.ceil(parameters.size() / 32.0);
     }
 
@@ -76,7 +78,7 @@ public final class MethodGenUtils {
      * @return true if include
      * @since 4.6.2
      */
-    public static boolean hasKotlinDefaultsParameters(List<ParameterElement> arguments) {
+    public static boolean hasKotlinDefaultsParameters(List<AnnotationMetadata> arguments) {
         return arguments.stream().anyMatch(p -> p instanceof KotlinParameterElement kp && kp.hasDefault());
     }
 
@@ -102,56 +104,79 @@ public final class MethodGenUtils {
                                                       List<? extends ExpressionDef> values,
                                                       @Nullable
                                                       List<? extends ExpressionDef> hasValuesExpressions) {
-        ClassTypeDef beanType = (ClassTypeDef) TypeDef.erasure(constructor.getOwningType());
+        return invokeBeanConstructor(
+            constructor.getOwningType(),
+            constructor.getName(),
+            constructor.getReturnType(),
+            Arrays.stream(constructor.getParameters()).map(AnnotationMetadataProvider::getAnnotationMetadata).toList(),
+            Arrays.stream(constructor.getParameters()).map(ParameterElement::getType).toList(),
+            constructor.isStatic(),
+            requiresReflection,
+            allowKotlinDefaults,
+            values,
+            hasValuesExpressions
+        );
+    }
 
-        boolean isConstructor = constructor.getName().equals("<init>");
-        boolean isCompanion = constructor.getOwningType().getSimpleName().endsWith("$Companion");
-        List<ParameterElement> constructorArguments = Arrays.asList(constructor.getParameters());
-        allowKotlinDefaults = allowKotlinDefaults && hasKotlinDefaultsParameters(constructorArguments);
+    public static ExpressionDef invokeBeanConstructor(ClassElement owningType,
+                                                       String methodName,
+                                                       ClassElement returningType,
+                                                       List<AnnotationMetadata> parameters,
+                                                       List<ClassElement> parameterTypes,
+                                                       boolean isStatic,
+                                                       boolean requiresReflection,
+                                                       boolean allowKotlinDefaults,
+                                                       @Nullable
+                                                       List<? extends ExpressionDef> values,
+                                                       @Nullable
+                                                       List<? extends ExpressionDef> hasValuesExpressions) {
+        ClassTypeDef beanType = (ClassTypeDef) TypeDef.erasure(owningType);
 
-        List<ExpressionDef> constructorValues = constructorValues(constructor.getParameters(), values, hasValuesExpressions, allowKotlinDefaults);
+        boolean isConstructor = methodName.equals("<init>");
+        boolean isCompanion = owningType.getSimpleName().endsWith("$Companion");
+        allowKotlinDefaults = allowKotlinDefaults && hasKotlinDefaultsParameters(parameters);
 
+        List<ExpressionDef> constructorValues = constructorValues(parameterTypes, values, hasValuesExpressions, allowKotlinDefaults);
+        List<TypeDef> params = parameterTypes.stream().map(TypeDef::erasure).toList();
         if (requiresReflection && !isCompanion) { // Companion and reflection not implemented
             return ClassTypeDef.of(InstantiationUtils.class).invokeStatic(
-                    INSTANTIATE_METHOD,
+                INSTANTIATE_METHOD,
 
-                    ExpressionDef.constant(beanType),
-                    TypeDef.CLASS.array().instantiate(
-                            Arrays.stream(constructor.getParameters()).map(param ->
-                                    ExpressionDef.constant(TypeDef.erasure(param.getType()))
-                            ).toList()
-                    ),
-                    TypeDef.OBJECT.array().instantiate(constructorValues)
+                ExpressionDef.constant(beanType),
+                TypeDef.CLASS.array().instantiate(
+                        params.stream().map(ExpressionDef::constant
+                    ).toList()
+                ),
+                TypeDef.OBJECT.array().instantiate(constructorValues)
             );
         }
-
         if (isConstructor) {
             if (allowKotlinDefaults) {
-                int numberOfMasks = calculateNumberOfKotlinDefaultsMasks(constructorArguments);
+                int numberOfMasks = calculateNumberOfKotlinDefaultsMasks(parameters);
                 // Calculate the Kotlin defaults mask
                 // Every bit indicated true/false if the parameter should have the default value set
-                ExpressionDef[] masksExpressions = computeKotlinDefaultsMask(numberOfMasks, constructorArguments, hasValuesExpressions);
+                ExpressionDef[] masksExpressions = computeKotlinDefaultsMask(numberOfMasks, parameters, hasValuesExpressions);
 
                 List<ExpressionDef> newValues = new ArrayList<>();
                 newValues.addAll(constructorValues);
                 newValues.addAll(List.of(masksExpressions)); // Bit mask of defaults
                 newValues.add(ExpressionDef.nullValue()); // Last parameter is just a marker and is always null
-                List<TypeDef> defaultKotlinConstructorParameters = getDefaultKotlinConstructorParameters(constructor.getParameters(), masksExpressions.length);
+                List<TypeDef> defaultKotlinConstructorParameters = getDefaultKotlinConstructorParameters(parameterTypes, masksExpressions.length);
                 return beanType.instantiate(
                         defaultKotlinConstructorParameters,
                         newValues
                 );
             }
-            return beanType.instantiate(constructor, constructorValues);
-        } else if (constructor.isStatic()) {
-            return beanType.invokeStatic(constructor, constructorValues);
+            return beanType.instantiate(params, constructorValues);
         } else if (isCompanion) {
-            if (constructor.isStatic()) {
-                return beanType.invokeStatic(constructor, constructorValues);
+            if (isStatic) {
+                return beanType.invokeStatic(methodName, params, TypeDef.erasure(returningType), constructorValues);
             }
-            return ((ClassTypeDef) TypeDef.erasure(constructor.getReturnType()))
+            return ((ClassTypeDef) TypeDef.erasure(returningType))
                     .getStaticField("Companion", beanType)
-                    .invoke(constructor, constructorValues);
+                    .invoke(methodName, params, TypeDef.erasure(returningType), constructorValues);
+        } else if (isStatic) {
+            return beanType.invokeStatic(methodName, params, TypeDef.erasure(returningType), constructorValues);
         }
         throw new IllegalStateException("Unknown constructor");
     }
@@ -174,15 +199,15 @@ public final class MethodGenUtils {
         return ClassTypeDef.of(declaringType).invokeStatic(defaultKotlinMethod, newValues);
     }
 
-    private static List<ExpressionDef> constructorValues(ParameterElement[] constructorArguments,
+    private static List<ExpressionDef> constructorValues(List<ClassElement> constructorArguments,
                                                          @Nullable
                                                          List<? extends ExpressionDef> values,
                                                          @Nullable
                                                          List<? extends ExpressionDef> hasValuesExpressions,
                                                          boolean addKotlinDefaults) {
-        List<ExpressionDef> expressions = new ArrayList<>(constructorArguments.length);
-        for (int i = 0; i < constructorArguments.length; i++) {
-            ParameterElement constructorArgument = constructorArguments[i];
+        List<ExpressionDef> expressions = new ArrayList<>(constructorArguments.size());
+        for (int i = 0; i < constructorArguments.size(); i++) {
+            ClassElement paramType = constructorArguments.get(i);
             ExpressionDef value = values == null ? null : values.get(i);
             if (value != null) {
                 if (!addKotlinDefaults || value instanceof ExpressionDef.Constant constant && constant.value() != null) {
@@ -190,9 +215,9 @@ public final class MethodGenUtils {
                 } else if (hasValuesExpressions != null) {
                     // There should be a better way to check if the value exists only once
                     expressions.add(
-                        hasValuesExpressions.get(i).isTrue().doIfElse(value, getDefaultValue(constructorArgument))
+                        hasValuesExpressions.get(i).isTrue().doIfElse(value, getDefaultValue(paramType))
                     );
-                } else if (!constructorArgument.isPrimitive()) {
+                } else if (!paramType.isPrimitive()) {
                     expressions.add(value);
                 } else {
                     expressions.add(
@@ -201,19 +226,18 @@ public final class MethodGenUtils {
                                             ReflectionUtils.getRequiredMethod(Objects.class, "requireNonNullElse", Object.class, Object.class),
 
                                             value.cast(TypeDef.OBJECT), // Remove any previous casts
-                                            getDefaultValue(constructorArgument)
+                                            getDefaultValue(paramType)
                                     ).cast(value.type())
                     );
                 }
                 continue;
             }
-            expressions.add(getDefaultValue(constructorArgument));
+            expressions.add(getDefaultValue(paramType));
         }
         return expressions;
     }
 
-    private static ExpressionDef getDefaultValue(ParameterElement constructorArgument) {
-        ClassElement type = constructorArgument.getType();
+    private static ExpressionDef getDefaultValue(ClassElement type) {
         if (type.isPrimitive() && !type.isArray()) {
             if (type.equals(PrimitiveElement.BOOLEAN)) {
                 return ExpressionDef.falseValue();
@@ -223,10 +247,10 @@ public final class MethodGenUtils {
         return ExpressionDef.nullValue();
     }
 
-    private static List<TypeDef> getDefaultKotlinConstructorParameters(ParameterElement[] constructorArguments, int numberOfMasks) {
-        List<TypeDef> parameters = new ArrayList<>(constructorArguments.length + numberOfMasks + 1);
-        for (ParameterElement constructorArgument : constructorArguments) {
-            parameters.add(TypeDef.erasure(constructorArgument.getType()));
+    private static List<TypeDef> getDefaultKotlinConstructorParameters(List<ClassElement> constructorArguments, int numberOfMasks) {
+        List<TypeDef> parameters = new ArrayList<>(constructorArguments.size() + numberOfMasks + 1);
+        for (ClassElement constructorArgument : constructorArguments) {
+            parameters.add(TypeDef.erasure(constructorArgument));
         }
         for (int i = 0; i < numberOfMasks; i++) {
             parameters.add(TypeDef.Primitive.INT);
@@ -253,20 +277,20 @@ public final class MethodGenUtils {
     }
 
     private static ExpressionDef[] computeKotlinDefaultsMask(int numberOfMasks,
-                                                            List<ParameterElement> parameters,
+                                                            List<AnnotationMetadata> parameters,
                                                             @Nullable
                                                             List<? extends ExpressionDef> hasValuesExpressions) {
         ExpressionDef[] masksLocal = new ExpressionDef[numberOfMasks];
         for (int i = 0; i < numberOfMasks; i++) {
             int fromIndex = i * 32;
-            List<ParameterElement> params = parameters.subList(fromIndex, Math.min(fromIndex + 32, parameters.size()));
+            List<AnnotationMetadata> params = parameters.subList(fromIndex, Math.min(fromIndex + 32, parameters.size()));
             if (hasValuesExpressions == null) {
                 masksLocal[i] = TypeDef.Primitive.INT.constant((int) ((long) Math.pow(2, params.size() + 1) - 1));
             } else {
                 ExpressionDef maskValue = TypeDef.Primitive.INT.constant(0);
                 int maskIndex = 1;
                 int paramIndex = fromIndex;
-                for (ParameterElement parameter : params) {
+                for (AnnotationMetadata parameter : params) {
                     if (parameter instanceof KotlinParameterElement kp && kp.hasDefault()) {
                         maskValue = writeMask(hasValuesExpressions, kp, paramIndex, maskIndex, maskValue);
                     }

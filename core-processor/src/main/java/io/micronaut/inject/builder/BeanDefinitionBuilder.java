@@ -9,12 +9,14 @@ public interface BeanDefinitionBuilder<T> {
     void constructor(ConstructorDefinition<T> constructorDefinition);
 
 
-    record ConstructorDefinition<K>(AnnotationMetadata annotationMetadata,
-                                    List<BeanDefinitionInjectionPoint<K>> injectionPoints,
+    record ConstructorDefinition<K>(K owningType,
+                                    AnnotationMetadata annotationMetadata,
+                                    List<BeanDefinitionInjectionPoint<K>> parameters,
                                     boolean requiresReflection) implements AnnotationMetadataProviderRecordStyle {
     }
 
-    record MethodDefinition<K>(AnnotationMetadata annotationMetadata,
+    record MethodDefinition<K>(K owningType,
+                               AnnotationMetadata annotationMetadata,
                                BeanDefinitionInjectionPoint<K> injectionPoint) implements AnnotationMetadataProviderRecordStyle {
     }
 }

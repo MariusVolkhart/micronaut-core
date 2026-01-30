@@ -30,6 +30,7 @@ import io.micronaut.context.BeanRegistration;
 import io.micronaut.context.BeanResolutionContext;
 import io.micronaut.context.Qualifier;
 import io.micronaut.core.annotation.AnnotationMetadata;
+import io.micronaut.core.annotation.AnnotationMetadataProvider;
 import io.micronaut.core.annotation.AnnotationUtil;
 import io.micronaut.core.annotation.AnnotationValue;
 import io.micronaut.core.annotation.Generated;
@@ -359,6 +360,16 @@ public class AopProxyWriter extends ProxyingBeanDefinitionWriter {
      */
     public static int findInterceptorsListParameterIndex(List<ParameterElement> parameters) {
         return parameters.indexOf(parameters.stream().filter(p -> p.getName().equals(INTERCEPTORS_PARAMETER)).findFirst().orElseThrow());
+    }
+
+    /**
+     * Find the interceptors list constructor parameter index.
+     *
+     * @param parameters The constructor parameters
+     * @return the index
+     */
+    public static int findInterceptorsListParameterIndex2(List<? extends AnnotationMetadataProvider> parameters) {
+        return parameters.indexOf(parameters.stream().filter(p -> ((ParameterElement) p.getAnnotationMetadata()).getName().equals(INTERCEPTORS_PARAMETER)).findFirst().orElseThrow());
     }
 
     private void initConstructor(MethodElement constructor) {
