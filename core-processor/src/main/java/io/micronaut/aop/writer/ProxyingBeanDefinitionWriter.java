@@ -444,12 +444,12 @@ public abstract class ProxyingBeanDefinitionWriter implements ProxyingBeanDefini
         MethodElement methodElement,
         boolean requiresReflection,
         VisitorContext visitorContext) {
-        deferredInjectionPoints.add(() -> proxyBeanDefinitionWriter.visitPostConstructMethod(
+        proxyBeanDefinitionWriter.visitPostConstructMethod(
             declaringType,
             methodElement,
             requiresReflection,
             visitorContext
-        ));
+        );
     }
 
     @Override
@@ -458,13 +458,11 @@ public abstract class ProxyingBeanDefinitionWriter implements ProxyingBeanDefini
         MethodElement methodElement,
         boolean requiresReflection,
         VisitorContext visitorContext) {
-        deferredInjectionPoints.add(() ->
-            proxyBeanDefinitionWriter.visitPreDestroyMethod(
-                declaringType,
-                methodElement,
-                requiresReflection,
-                visitorContext)
-        );
+        proxyBeanDefinitionWriter.visitPreDestroyMethod(
+            declaringType,
+            methodElement,
+            requiresReflection,
+            visitorContext);
     }
 
     @Override
@@ -617,15 +615,12 @@ public abstract class ProxyingBeanDefinitionWriter implements ProxyingBeanDefini
     }
 
     protected final void processAlreadyVisitedMethods(BeanDefinitionWriter parent) {
-        final List<BeanDefinitionWriter.MethodVisitData> postConstructMethodVisits = parent.getPostConstructMethodVisits();
-        for (BeanDefinitionWriter.MethodVisitData methodVisit : postConstructMethodVisits) {
-            visitPostConstructMethod(
-                methodVisit.getBeanType(),
-                methodVisit.getMethodElement(),
-                methodVisit.isRequiresReflection(),
-                visitorContext
-            );
-        }
+        parent.postConstructMethods.forEach(d -> visitPostConstructMethod(
+            d.methodElement().getDeclaringType(),
+            d.methodElement(),
+            d.requiresReflection(),
+            visitorContext
+        ));
     }
 
     @Override
